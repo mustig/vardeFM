@@ -21,7 +21,8 @@
 //!
 //! A separate pass counts detections and decoded headers per minute on audio that
 //! holds no burst (a carrier at -10 dB CNR, which sounds like an open squelch, a
-//! weak unmodulated carrier, tones, white noise).
+//! weak unmodulated carrier, white noise, and keyed tones: 750 + 1500 Hz, a roger
+//! beep and DTMF pairs, each 0.3 s on and 0.3 s off).
 //! A detection there costs a header decode; a decoded header there is a false burst.
 //!
 //! `cargo test --release -p vardefm-modem detector_eval -- --ignored --nocapture`
@@ -185,9 +186,21 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-/// Audio with no burst in it, `seconds` long, for the false-detection pass.
-fn noise_cases(mode: &str, seconds: f32) -> Vec<(&'static str, Vec<f32>)> {
-    let n = (seconds * 48_000.0) as usize;
+/// The kinds of audio without a burst in the false-detection pass, for [`noise_case`].
+const NOISE_CASES: [&str; 4] = ["carrier at -10 dB CNR", "weak carrier, 5 dB CNR", "white noise", "keyed tones"];
+
+/// Tone sets for the "keyed tones" case, Hz. 750 + 1500 Hz repeat every nfft/2
+/// samples in both modes, like preamble A; then a roger beep and DTMF pairs.
+const KEYED_TONES: [&[u64]; 6] = [&[750, 1500], &[1000], &[697, 1209], &[770, 1336], &[852, 1477], &[941, 1633]];
+/// On and off time of each keyed tone, seconds.
+const KEYED_TONE_S: f32 = 0.3;
+
+/// Audio without a burst, `seconds` long at `fs` Hz: case `case` of [`NOISE_CASES`].
+///
+/// The keyed tones stop after each 0.3 s: a tone that never stops cannot end a
+/// Schmidl-Cox plateau, so it would never be evaluated as a detection.
+fn noise_case(mode: &str, case: usize, seconds: f32, fs: f32) -> Vec<f32> {
+    let n = (seconds * fs) as usize;
     // No silence around the carrier, so the audio is exactly `seconds` of noise.
     let base = FmChannelConfig {
         keyup_delay_s: 0.0,
@@ -195,20 +208,32 @@ fn noise_cases(mode: &str, seconds: f32) -> Vec<(&'static str, Vec<f32>)> {
         trail_silence_s: 0.0,
         ..FmChannelConfig::by_name(mode).unwrap()
     };
-    let mut rng = Prng::new(99);
-    let white: Vec<f32> = (0..n).map(|_| (rng.next_u32() as f32 / u32::MAX as f32 - 0.5) * 0.6).collect();
-    let tones: Vec<f32> = (0..n)
-        .map(|i| {
-            let t = i as f32 / 48_000.0;
-            0.15 * ((2.0 * PI * 750.0 * t).sin() + (2.0 * PI * 1500.0 * t).sin())
-        })
-        .collect();
-    vec![
-        ("carrier at -10 dB CNR", transmit(&FmChannelConfig { cnr_db: Some(-10.0), ..base.clone() }, &vec![0.0; n])),
-        ("weak carrier, 5 dB CNR", transmit(&FmChannelConfig { cnr_db: Some(5.0), ..base }, &vec![0.0; n])),
-        ("white noise", white),
-        ("750 + 1500 Hz tones", tones),
-    ]
+    match case {
+        0 => transmit(&FmChannelConfig { cnr_db: Some(-10.0), ..base }, &vec![0.0; n]),
+        1 => transmit(&FmChannelConfig { cnr_db: Some(5.0), ..base }, &vec![0.0; n]),
+        2 => {
+            let mut rng = Prng::new(99);
+            (0..n).map(|_| (rng.next_u32() as f32 / u32::MAX as f32 - 0.5) * 0.6).collect()
+        }
+        3 => {
+            let rate = fs as u64;
+            let slot = (KEYED_TONE_S * fs) as usize;
+            (0..n)
+                .map(|i| {
+                    let (k, on) = (i / slot, i % slot);
+                    if k % 2 == 1 {
+                        return 0.0;
+                    }
+                    // Phase from an integer index, exact however long the audio is.
+                    KEYED_TONES[k / 2 % KEYED_TONES.len()]
+                        .iter()
+                        .map(|&f| 0.15 * (2.0 * PI * ((on as u64 * f) % rate) as f32 / rate as f32).sin())
+                        .sum()
+                })
+                .collect()
+        }
+        _ => unreachable!("noise case {case}"),
+    }
 }
 
 /// Detections and decoded headers in `rx`, scanning on after each detection.
@@ -280,7 +305,8 @@ fn detector_eval() {
             println!("{line}");
         }
         println!("{mode}: per minute of audio without a burst, detections / decoded headers");
-        for (case, audio) in noise_cases(mode, noise_s) {
+        for (c, case) in NOISE_CASES.iter().enumerate() {
+            let audio = noise_case(mode, c, noise_s, 48_000.0);
             let mut line = format!("  {case:26}");
             let per_min = 60.0 / (audio.len() as f32 / 48_000.0);
             for (name, f) in DETECTORS {
@@ -304,7 +330,7 @@ fn harness_sees_strong_bursts_and_no_false_headers() {
             assert!(r.genie, "{mode}: genie failed on a strong signal");
             assert!(r.det.iter().all(|&(_, ok)| ok), "{mode}: a detector missed a strong burst");
         }
-        let (_, audio) = noise_cases(mode, 2.0).swap_remove(0);
+        let audio = noise_case(mode, 0, 2.0, m.fs());
         for (name, f) in DETECTORS {
             assert_eq!(false_detections(&m, *f, &audio).1, 0, "{mode}: {name} decoded a header from noise");
         }
