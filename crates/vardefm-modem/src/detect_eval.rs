@@ -3,15 +3,21 @@
 //! Every detector sees exactly the same received audio, so differences are paired
 //! and can be tested with McNemar's exact test instead of comparing two noisy rates.
 //! For each CNR it reports, per detector:
-//! - `hit`: the detector found the burst within ±ncp/4 samples of the true preamble B;
-//! - `burst`: the whole burst (header and every codeword) decoded from where the
-//!   detector pointed, as the streaming receiver would decode it.
+//! - `burst`, the measure that counts: the whole burst (header and every codeword)
+//!   decoded the way `Receiver` decodes it. Like `Receiver::step`, it tries the header
+//!   at each detection in turn, searches on after one that fails, and keeps the first
+//!   header that decodes;
+//! - `hit`: that position agrees within ±ncp/4 samples with the true position, which
+//!   is where Schmidl-Cox's preamble-B fine timing lands on a noiseless copy. A detector
+//!   that always picks another point inside the cyclic prefix can decode every burst
+//!   and still score few hits, so read `hit` as a diagnostic only.
 //!
 //! `genie` decodes from the true position. It is the ceiling for any detector: the
 //! gap between `genie` and a detector is what detection costs at that CNR.
 //!
 //! A separate pass counts detections and decoded headers per minute on audio that
-//! holds no burst (squelch noise, a weak unmodulated carrier, tones, white noise).
+//! holds no burst (a carrier at -10 dB CNR, which sounds like an open squelch, a
+//! weak unmodulated carrier, tones, white noise).
 //! A detection there costs a header decode; a decoded header there is a false burst.
 //!
 //! `cargo test --release -p vardefm-modem detector_eval -- --ignored --nocapture`
@@ -52,24 +58,40 @@ fn burst(level: u8, ncw: usize, seed: u32) -> Burst {
     }
 }
 
-/// Decode the burst whose preamble B starts at `b` the way `Receiver` does, and
-/// say whether header and every codeword came out as sent.
-fn decodes_at(m: &Modem, rx: &[f32], b: usize, sent: &Burst) -> bool {
-    let hdr_syms = m.header_symbols();
-    let Some(h) = m.ofdm.demodulate(rx, b, hdr_syms).and_then(|f| m.decode_header(&f)) else {
-        return false;
-    };
-    if h != sent.header {
+/// The header of the burst whose preamble B starts at `b`, if it decodes.
+fn header_at(m: &Modem, rx: &[f32], b: usize) -> Option<Header> {
+    m.ofdm.demodulate(rx, b, m.header_symbols()).and_then(|f| m.decode_header(&f))
+}
+
+/// Whether the burst at `b`, whose header `h` has decoded, is the one sent: header
+/// equal and every codeword decoded and equal, with the header as channel training
+/// as in `Receiver::step`.
+fn burst_ok(m: &Modem, rx: &[f32], b: usize, h: &Header, sent: &Burst) -> bool {
+    if *h != sent.header {
         return false;
     }
     if h.ncw == 0 {
         return true;
     }
-    let nsym = hdr_syms + h.ncw as usize * m.symbols_per_codeword(h.level);
-    let Some(frame) = m.ofdm.demodulate_known(rx, b, nsym, &m.header_carriers(&h)) else {
+    let nsym = m.header_symbols() + h.ncw as usize * m.symbols_per_codeword(h.level);
+    let Some(frame) = m.ofdm.demodulate_known(rx, b, nsym, &m.header_carriers(h)) else {
         return false;
     };
-    m.decode_payload(&h, &frame).into_iter().zip(&sent.payload).all(|(got, want)| got.as_ref() == Some(want))
+    m.decode_payload(h, &frame).into_iter().zip(&sent.payload).all(|(got, want)| got.as_ref() == Some(want))
+}
+
+/// What `Receiver` makes of `rx` with detector `f`: the position of the first
+/// detection whose header decodes (searching on after each one that fails), and
+/// whether that burst came out as sent. `None` if no header decodes.
+fn receive(m: &Modem, f: DetectFn, rx: &[f32], sent: &Burst) -> Option<(usize, bool)> {
+    let mut from = 0;
+    while let Some(b) = f(m, rx, from) {
+        if let Some(h) = header_at(m, rx, b) {
+            return Some((b, burst_ok(m, rx, b, &h, sent)));
+        }
+        from = b + 1;
+    }
+    None
 }
 
 /// Outcome of one trial: (hit, burst) per detector, then the genie's burst.
@@ -87,12 +109,13 @@ fn trial(m: &Modem, mode: &str, cnr: f32, sent: &Burst, tx: &[f32], seed: u64) -
     let tol = m.ofdm.p.ncp / 4;
     let det = DETECTORS
         .iter()
-        .map(|(_, f)| match f(m, &rx, 0) {
-            Some(b) => (b.abs_diff(truth) <= tol, decodes_at(m, &rx, b, sent)),
+        .map(|(_, f)| match receive(m, *f, &rx, sent) {
+            Some((b, ok)) => (b.abs_diff(truth) <= tol, ok),
             None => (false, false),
         })
         .collect();
-    Trial { det, genie: decodes_at(m, &rx, truth, sent) }
+    let genie = header_at(m, &rx, truth).is_some_and(|h| burst_ok(m, &rx, truth, &h, sent));
+    Trial { det, genie }
 }
 
 /// Run `trials` trials on every core. Trial `t` uses channel seed `1000 + t`.
@@ -123,12 +146,12 @@ fn mcnemar(b: u32, c: u32) -> f64 {
     if n == 0 {
         return 1.0;
     }
-    let k = b.min(c);
-    let mut term = 0.5f64.powi(n as i32);
+    // Binomial(n, 1/2) terms in log space: 0.5^n alone underflows from n = 1075.
+    let mut ln_term = n as f64 * 0.5f64.ln();
     let mut tail = 0.0;
-    for i in 0..=k {
-        tail += term;
-        term *= (n - i) as f64 / (i + 1) as f64;
+    for i in 0..=b.min(c) {
+        tail += ln_term.exp();
+        ln_term += ((n - i) as f64 / (i + 1) as f64).ln();
     }
     (2.0 * tail).min(1.0)
 }
@@ -140,7 +163,13 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 /// Audio with no burst in it, `seconds` long, for the false-detection pass.
 fn noise_cases(mode: &str, seconds: f32) -> Vec<(&'static str, Vec<f32>)> {
     let n = (seconds * 48_000.0) as usize;
-    let base = FmChannelConfig { keyup_delay_s: 0.0, ..FmChannelConfig::by_name(mode).unwrap() };
+    // No silence around the carrier, so the audio is exactly `seconds` of noise.
+    let base = FmChannelConfig {
+        keyup_delay_s: 0.0,
+        lead_silence_s: 0.0,
+        trail_silence_s: 0.0,
+        ..FmChannelConfig::by_name(mode).unwrap()
+    };
     let mut rng = Prng::new(99);
     let white: Vec<f32> = (0..n).map(|_| (rng.next_u32() as f32 / u32::MAX as f32 - 0.5) * 0.6).collect();
     let tones: Vec<f32> = (0..n)
@@ -150,7 +179,7 @@ fn noise_cases(mode: &str, seconds: f32) -> Vec<(&'static str, Vec<f32>)> {
         })
         .collect();
     vec![
-        ("squelch open, no carrier", transmit(&FmChannelConfig { cnr_db: Some(-10.0), ..base.clone() }, &vec![0.0; n])),
+        ("carrier at -10 dB CNR", transmit(&FmChannelConfig { cnr_db: Some(-10.0), ..base.clone() }, &vec![0.0; n])),
         ("weak carrier, 5 dB CNR", transmit(&FmChannelConfig { cnr_db: Some(5.0), ..base }, &vec![0.0; n])),
         ("white noise", white),
         ("750 + 1500 Hz tones", tones),
@@ -216,16 +245,16 @@ fn detector_eval() {
                 }
             }
             if let Some(f) = &mut csv {
-                writeln!(f, "{mode},{level},{ncw},{cnr},{trials},genie,{trials},{genie}").unwrap();
+                writeln!(f, "{mode},{level},{ncw},{cnr},{trials},genie,,{genie}").unwrap();
             }
             println!("{line}");
         }
         println!("{mode}: per minute of audio without a burst, detections / decoded headers");
         for (case, audio) in noise_cases(mode, noise_s) {
             let mut line = format!("  {case:26}");
+            let per_min = 60.0 / (audio.len() as f32 / 48_000.0);
             for (name, f) in DETECTORS {
                 let (d, h) = false_detections(&m, *f, &audio);
-                let per_min = 60.0 / noise_s;
                 line += &format!(" | {name} {:7.2} / {:5.2}", d as f32 * per_min, h as f32 * per_min);
             }
             println!("{line}");
@@ -234,7 +263,7 @@ fn detector_eval() {
 }
 
 /// The harness itself: on a strong signal every detector and the genie decode every
-/// burst, and the reference detector raises no false headers on squelch noise.
+/// burst, and no detector raises a false header on a carrier at -10 dB CNR.
 #[test]
 fn harness_sees_strong_bursts_and_no_false_headers() {
     for mode in ["narrow", "wide"] {
@@ -257,4 +286,7 @@ fn mcnemar_matches_known_values() {
     assert!((mcnemar(0, 5) - 0.0625).abs() < 1e-12);
     assert!((mcnemar(2, 8) - 0.109375).abs() < 1e-12);
     assert_eq!(mcnemar(4, 4), 1.0);
+    // Past the point where 0.5^n underflows.
+    assert_eq!(mcnemar(1100, 1100), 1.0);
+    assert!(mcnemar(1000, 1200) < 1e-4);
 }
