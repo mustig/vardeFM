@@ -103,10 +103,13 @@ fn receive(m: &Modem, f: DetectFn, rx: &[f32], sent: &Burst) -> Outcome {
         if let Some(h) = header_at(m, rx, b) {
             return Outcome { first, ok: burst_ok(m, rx, b, &h, sent) };
         }
-        // As `Receiver::step`: search on from the failed detection itself. Neither
-        // detector can return `b` again from there, since both report a position
-        // past the start of the preamble they matched.
+        // As `Receiver::step`: search on from the failed detection itself. That
+        // needs a detector that reports a position past the start of what it
+        // matched; one that returns `b` again would hang the evaluation, so stop.
         next = f(m, rx, b);
+        if let Some(n) = next {
+            assert!(n > b, "detector returned {n} when searching from {b}: it would loop forever");
+        }
     }
     Outcome { first, ok: false }
 }
