@@ -13,8 +13,11 @@
 //!   inside the cyclic prefix can decode every burst and still score few hits, so read
 //!   `hit` as a diagnostic only.
 //!
-//! `genie` decodes from the true position. It is the ceiling for any detector: the
-//! gap between `genie` and a detector is what detection costs at that CNR.
+//! `genie` decodes from the true position: a known-timing reference, not a strict
+//! bound. Another valid position inside the cyclic prefix puts the FFT windows on
+//! other noise samples and can decode a recording that fails at the true position,
+//! so a detector may occasionally beat it. The gap between `genie` and a detector
+//! approximates what detection costs at that CNR.
 //!
 //! A separate pass counts detections and decoded headers per minute on audio that
 //! holds no burst (a carrier at -10 dB CNR, which sounds like an open squelch, a
@@ -227,6 +230,7 @@ fn detector_eval() {
     let level: u8 = env_or("LEVEL", 1);
     let ncw: usize = env_or("NCW", 1);
     let noise_s: f32 = env_or("NOISE_SECONDS", 60.0);
+    assert!((level as usize) < LEVELS.len(), "LEVEL {level}: levels are 0 to {}", LEVELS.len() - 1);
     let mut csv = std::env::var("CSV").ok().map(|p| {
         let new = !std::path::Path::new(&p).exists();
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p).unwrap();
@@ -242,6 +246,10 @@ fn detector_eval() {
     );
     for mode in modes.split(',') {
         let m = modem(mode);
+        // A longer burst would modulate, but its header would not unpack (MAX_NCW) or
+        // the modem would never send it (MAX_PAYLOAD_SECONDS): every trial would fail.
+        let max = m.max_ncw(level);
+        assert!(ncw <= max, "NCW {ncw}: a level {level} burst in {mode} mode holds at most {max} codewords");
         let sent = burst(level, ncw, 7);
         let default_cnrs = if mode == "narrow" { "3,4,5,6,7,8,10" } else { "5,6,7,8,9,10,12" };
         let cnrs: String = env_or("CNRS", default_cnrs.to_string());
@@ -282,7 +290,8 @@ fn detector_eval() {
 }
 
 /// The harness itself: on a strong signal every detector and the genie decode every
-/// burst, and no detector raises a false header on a carrier at -10 dB CNR.
+/// burst, and no detector raises a false header on a carrier at -10 dB CNR. `hit` is
+/// a diagnostic, so it is not required here.
 #[test]
 fn harness_sees_strong_bursts_and_no_false_headers() {
     for mode in ["narrow", "wide"] {
@@ -290,7 +299,7 @@ fn harness_sees_strong_bursts_and_no_false_headers() {
         let sent = burst(1, 1, 7);
         for r in run_trials(&m, mode, 25.0, &sent, 4) {
             assert!(r.genie, "{mode}: genie failed on a strong signal");
-            assert!(r.det.iter().all(|&(hit, ok)| hit && ok), "{mode}: a detector missed a strong burst");
+            assert!(r.det.iter().all(|&(_, ok)| ok), "{mode}: a detector missed a strong burst");
         }
         let (_, audio) = noise_cases(mode, 2.0).swap_remove(0);
         for (name, f) in DETECTORS {
