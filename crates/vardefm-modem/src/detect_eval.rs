@@ -182,8 +182,13 @@ fn mcnemar(b: u32, c: u32) -> f64 {
     (2.0 * tail).min(1.0)
 }
 
+/// Environment variable `name` parsed as `T`, or `default` when unset. A value that
+/// does not parse stops the run: falling back would quietly run something else.
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    match std::env::var(name) {
+        Ok(v) => v.trim().parse().unwrap_or_else(|_| panic!("{name}={v:?} does not parse")),
+        Err(_) => default,
+    }
 }
 
 /// The kinds of audio without a burst in the false-detection pass, for [`noise_case`].
@@ -201,6 +206,7 @@ const KEYED_TONE_S: f32 = 0.3;
 /// Schmidl-Cox plateau, so it would never be evaluated as a detection.
 fn noise_case(mode: &str, case: usize, seconds: f32, fs: f32) -> Vec<f32> {
     let n = (seconds * fs) as usize;
+    assert!(n > 0, "{seconds} s of noise is less than one sample");
     // No silence around the carrier, so the audio is exactly `seconds` of noise.
     let base = FmChannelConfig {
         keyup_delay_s: 0.0,
@@ -259,6 +265,21 @@ fn detector_eval() {
     let ncw: usize = env_or("NCW", 1);
     let noise_s: f32 = env_or("NOISE_SECONDS", 60.0);
     assert!((level as usize) < LEVELS.len(), "LEVEL {level}: levels are 0 to {}", LEVELS.len() - 1);
+    assert!(trials > 0, "TRIALS must be at least 1");
+    assert!(noise_s > 0.0, "NOISE_SECONDS={noise_s}: must be more than 0");
+    // Checked up front, so that a typo does not fail after the first mode has run.
+    let modes: Vec<&str> = modes.split(',').map(str::trim).collect();
+    for mode in &modes {
+        assert!(OfdmParams::by_name(mode).is_some(), "MODES: unknown mode {mode:?} (narrow or wide)");
+    }
+    let cnr_list = |mode: &str| -> Vec<f32> {
+        let default = if mode == "narrow" { "3,4,5,6,7,8,10" } else { "5,6,7,8,9,10,12" };
+        let cnrs: String = env_or("CNRS", default.to_string());
+        cnrs.split(',').map(|c| c.trim().parse().unwrap_or_else(|_| panic!("CNRS: {c:?} is not a number"))).collect()
+    };
+    for mode in &modes {
+        cnr_list(mode);
+    }
     let mut csv = std::env::var("CSV").ok().map(|p| {
         let new = !std::path::Path::new(&p).exists();
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p).unwrap();
@@ -272,17 +293,15 @@ fn detector_eval() {
         "level {level} ({}), {ncw} codeword(s), {trials} trials per point, txdelay {TXDELAY} s",
         LEVELS[level as usize].name
     );
-    for mode in modes.split(',') {
+    for &mode in &modes {
         let m = modem(mode);
         // A longer burst would modulate, but its header would not unpack (MAX_NCW) or
         // the modem would never send it (MAX_PAYLOAD_SECONDS): every trial would fail.
         let max = m.max_ncw(level);
         assert!(ncw <= max, "NCW {ncw}: a level {level} burst in {mode} mode holds at most {max} codewords");
         let sent = burst(level, ncw, 7);
-        let default_cnrs = if mode == "narrow" { "3,4,5,6,7,8,10" } else { "5,6,7,8,9,10,12" };
-        let cnrs: String = env_or("CNRS", default_cnrs.to_string());
         println!("\n{mode}: hits and decoded bursts out of {trials}; paired test against '{}'", names[0]);
-        for cnr in cnrs.split(',').map(|c| c.trim().parse::<f32>().unwrap()) {
+        for cnr in cnr_list(mode) {
             let res = run_trials(&m, mode, cnr, &sent, trials);
             let genie = res.iter().filter(|r| r.genie).count();
             let mut line = format!("  CNR {cnr:5.1} dB  genie {genie:4}");
@@ -306,9 +325,9 @@ fn detector_eval() {
         }
         println!("{mode}: per minute of audio without a burst, detections / decoded headers");
         for (c, case) in NOISE_CASES.iter().enumerate() {
-            let audio = noise_case(mode, c, noise_s, 48_000.0);
+            let audio = noise_case(mode, c, noise_s, m.fs());
             let mut line = format!("  {case:26}");
-            let per_min = 60.0 / (audio.len() as f32 / 48_000.0);
+            let per_min = 60.0 / (audio.len() as f32 / m.fs());
             for (name, f) in DETECTORS {
                 let (d, h) = false_detections(&m, *f, &audio);
                 line += &format!(" | {name} {:7.2} / {:5.2}", d as f32 * per_min, h as f32 * per_min);
@@ -373,9 +392,11 @@ fn offline_receive_matches_the_streaming_receiver() {
                 let cfg =
                     FmChannelConfig { cnr_db: Some(cnr), seed: 1000 + seed, ..FmChannelConfig::by_name(mode).unwrap() };
                 let mut rx = transmit(&cfg, &tx);
-                rx.extend(vec![0.0; 48_000]);
+                rx.extend(vec![0.0; m.fs() as usize]);
                 let mut receiver = Receiver::new(m.clone());
-                let got: Vec<RxBurst> = rx.chunks(480).flat_map(|c| receiver.push(c)).collect();
+                // 10 ms chunks, as a sound card delivers them.
+                let chunk = (m.fs() / 100.0) as usize;
+                let got: Vec<RxBurst> = rx.chunks(chunk).flat_map(|c| receiver.push(c)).collect();
                 let streamed = got.first().is_some_and(|g| {
                     g.header == sent.header && g.payload.iter().zip(&sent.payload).all(|(p, s)| p.as_ref() == Some(s))
                 });
