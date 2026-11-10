@@ -303,3 +303,6 @@ impl Modem {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod detect_eval;
