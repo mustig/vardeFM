@@ -323,32 +323,40 @@ fn mcnemar_matches_known_values() {
 
 /// `receive` must judge each recording the way the streaming `Receiver` does when
 /// it is fed the same audio in 10 ms chunks, including the recordings where the
-/// detector or the header fails. Checked with the receiver's own detector, on 12
-/// recordings per mode (`STREAM_SEEDS` for more).
+/// detector or the header fails. It uses `Ofdm::detect`, the call `Receiver` makes,
+/// whatever order `DETECTORS` is in.
+///
+/// Each seed runs at three CNRs per mode. At the lowest even genie decodes nothing
+/// and at the highest every detector so far decodes almost everything, so both
+/// outcomes occur whatever the receiver's detector is, and `STREAM_SEEDS=1` works.
+/// 12 seeds per mode by default.
 #[test]
 fn offline_receive_matches_the_streaming_receiver() {
+    const RECEIVER_DETECTOR: DetectFn = |m, rx, from| m.ofdm.detect(rx, from);
     let seeds: u64 = env_or("STREAM_SEEDS", 12);
-    for (mode, cnr) in [("narrow", 5.0), ("wide", 6.5)] {
+    for (mode, cnrs) in [("narrow", [3.0, 5.0, 8.0]), ("wide", [5.0, 7.0, 10.0])] {
         let m = modem(mode);
         let sent = burst(1, 1, 7);
         let tx = m.modulate(&sent);
-        let (mut agree, mut ok) = (0, 0);
+        let (mut total, mut ok) = (0, 0);
         for seed in 0..seeds {
-            let cfg =
-                FmChannelConfig { cnr_db: Some(cnr), seed: 1000 + seed, ..FmChannelConfig::by_name(mode).unwrap() };
-            let mut rx = transmit(&cfg, &tx);
-            rx.extend(vec![0.0; 48_000]);
-            let mut receiver = Receiver::new(m.clone());
-            let got: Vec<RxBurst> = rx.chunks(480).flat_map(|c| receiver.push(c)).collect();
-            let streamed = got.first().is_some_and(|g| {
-                g.header == sent.header && g.payload.iter().zip(&sent.payload).all(|(p, s)| p.as_ref() == Some(s))
-            });
-            let offline = receive(&m, DETECTORS[0].1, &rx, &sent).ok;
-            assert_eq!(offline, streamed, "{mode} {cnr} dB seed {seed}: offline {offline}, streaming {streamed}");
-            agree += 1;
-            ok += streamed as u32;
+            for cnr in cnrs {
+                let cfg =
+                    FmChannelConfig { cnr_db: Some(cnr), seed: 1000 + seed, ..FmChannelConfig::by_name(mode).unwrap() };
+                let mut rx = transmit(&cfg, &tx);
+                rx.extend(vec![0.0; 48_000]);
+                let mut receiver = Receiver::new(m.clone());
+                let got: Vec<RxBurst> = rx.chunks(480).flat_map(|c| receiver.push(c)).collect();
+                let streamed = got.first().is_some_and(|g| {
+                    g.header == sent.header && g.payload.iter().zip(&sent.payload).all(|(p, s)| p.as_ref() == Some(s))
+                });
+                let offline = receive(&m, RECEIVER_DETECTOR, &rx, &sent).ok;
+                assert_eq!(offline, streamed, "{mode} {cnr} dB seed {seed}: offline {offline}, streaming {streamed}");
+                total += 1;
+                ok += streamed as u32;
+            }
         }
         // Both outcomes must occur, or the comparison proves little.
-        assert!(ok > 0 && ok < agree, "{mode}: {ok} of {seeds} bursts decoded");
+        assert!(ok > 0 && ok < total, "{mode}: {ok} of {total} bursts decoded");
     }
 }
