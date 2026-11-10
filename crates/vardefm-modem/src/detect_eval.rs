@@ -121,41 +121,55 @@ struct Trial {
     genie: bool,
 }
 
-fn trial(m: &Modem, mode: &str, cnr: f32, sent: &Burst, tx: &[f32], truth: usize, seed: u64) -> Trial {
-    let cfg = FmChannelConfig { cnr_db: Some(cnr), seed, ..FmChannelConfig::by_name(mode).unwrap() };
-    let rx = transmit(&cfg, tx);
+/// Payload seed of trial `t`: every trial sends its own data, the same at every CNR.
+fn payload_seed(t: u32) -> u32 {
+    1 + t
+}
+
+/// Channel seed of trial `t` at `cnr` dB: every trial and every CNR point gets its
+/// own noise, so the points of a curve do not share noise realisations. All
+/// detectors still see the same recording within a trial, which keeps them paired.
+fn channel_seed(cnr: f32, t: u32) -> u64 {
+    (((cnr * 100.0).round() as i64 as u64) << 32) | t as u64
+}
+
+fn trial(m: &Modem, mode: &str, cnr: f32, level: u8, ncw: usize, truth: usize, t: u32) -> Trial {
+    let sent = burst(level, ncw, payload_seed(t));
+    let cfg =
+        FmChannelConfig { cnr_db: Some(cnr), seed: channel_seed(cnr, t), ..FmChannelConfig::by_name(mode).unwrap() };
+    let rx = transmit(&cfg, &m.modulate(&sent));
     let tol = m.ofdm.p.ncp / 4;
     let det = DETECTORS
         .iter()
         .map(|(_, f)| {
-            let o = receive(m, *f, &rx, sent);
+            let o = receive(m, *f, &rx, &sent);
             (o.first.is_some_and(|b| b.abs_diff(truth) <= tol), o.ok)
         })
         .collect();
-    let genie = header_at(m, &rx, truth).is_some_and(|h| burst_ok(m, &rx, truth, &h, sent));
+    let genie = header_at(m, &rx, truth).is_some_and(|h| burst_ok(m, &rx, truth, &h, &sent));
     Trial { det, genie }
 }
 
-/// Where preamble B of `tx` lands after the channel. The channel's delays do not
-/// depend on its noise, so a noiseless copy gives it for every trial.
-fn true_position(m: &Modem, mode: &str, tx: &[f32]) -> usize {
+/// Where preamble B of a `level` burst of `ncw` codewords lands after the channel.
+/// The channel's delays depend neither on its noise nor on the payload (the burst
+/// layout is fixed by level and size), so one noiseless copy gives it for every trial.
+fn true_position(m: &Modem, mode: &str, level: u8, ncw: usize) -> usize {
     let clean = FmChannelConfig { cnr_db: None, ..FmChannelConfig::by_name(mode).unwrap() };
-    m.ofdm.detect(&transmit(&clean, tx), 0).expect("burst not found on a clean channel")
+    let tx = m.modulate(&burst(level, ncw, payload_seed(0)));
+    m.ofdm.detect(&transmit(&clean, &tx), 0).expect("burst not found on a clean channel")
 }
 
-/// Run `trials` trials on every core. Trial `t` uses channel seed `1000 + t`.
-fn run_trials(m: &Modem, mode: &str, cnr: f32, sent: &Burst, trials: u32) -> Vec<Trial> {
-    let tx = m.modulate(sent);
-    let truth = true_position(m, mode, &tx);
+/// Run `trials` trials of a `level` burst of `ncw` codewords on every core.
+fn run_trials(m: &Modem, mode: &str, cnr: f32, level: u8, ncw: usize, trials: u32) -> Vec<Trial> {
+    let truth = true_position(m, mode, level, ncw);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
     let mut out: Vec<(u32, Trial)> = std::thread::scope(|s| {
-        let tx = &tx;
         let workers: Vec<_> = (0..threads)
             .map(|th| {
                 s.spawn(move || {
                     (th..trials)
                         .step_by(threads as usize)
-                        .map(|t| (t, trial(m, mode, cnr, sent, tx, truth, 1000 + t as u64)))
+                        .map(|t| (t, trial(m, mode, cnr, level, ncw, truth, t)))
                         .collect::<Vec<_>>()
                 })
             })
@@ -299,10 +313,9 @@ fn detector_eval() {
         // the modem would never send it (MAX_PAYLOAD_SECONDS): every trial would fail.
         let max = m.max_ncw(level);
         assert!(ncw <= max, "NCW {ncw}: a level {level} burst in {mode} mode holds at most {max} codewords");
-        let sent = burst(level, ncw, 7);
         println!("\n{mode}: hits and decoded bursts out of {trials}; paired test against '{}'", names[0]);
         for cnr in cnr_list(mode) {
-            let res = run_trials(&m, mode, cnr, &sent, trials);
+            let res = run_trials(&m, mode, cnr, level, ncw, trials);
             let genie = res.iter().filter(|r| r.genie).count();
             let mut line = format!("  CNR {cnr:5.1} dB  genie {genie:4}");
             for (d, name) in names.iter().enumerate() {
@@ -344,8 +357,14 @@ fn detector_eval() {
 fn harness_sees_strong_bursts_and_no_false_headers() {
     for mode in ["narrow", "wide"] {
         let m = modem(mode);
-        let sent = burst(1, 1, 7);
-        for r in run_trials(&m, mode, 25.0, &sent, 4) {
+        // The true position must not depend on the payload, or one copy could not give it.
+        let truth = true_position(&m, mode, 1, 1);
+        let clean = FmChannelConfig { cnr_db: None, ..FmChannelConfig::by_name(mode).unwrap() };
+        for t in 1..4 {
+            let tx = m.modulate(&burst(1, 1, payload_seed(t)));
+            assert_eq!(m.ofdm.detect(&transmit(&clean, &tx), 0), Some(truth), "{mode}: payload {t} moves the burst");
+        }
+        for r in run_trials(&m, mode, 25.0, 1, 1, 4) {
             assert!(r.genie, "{mode}: genie failed on a strong signal");
             assert!(r.det.iter().all(|&(_, ok)| ok), "{mode}: a detector missed a strong burst");
         }
