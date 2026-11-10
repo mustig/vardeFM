@@ -4,13 +4,14 @@
 //! and can be tested with McNemar's exact test instead of comparing two noisy rates.
 //! For each CNR it reports, per detector:
 //! - `burst`, the measure that counts: the whole burst (header and every codeword)
-//!   decoded the way `Receiver` decodes it. Like `Receiver::step`, it tries the header
-//!   at each detection in turn, searches on after one that fails, and keeps the first
-//!   header that decodes;
-//! - `hit`: that position agrees within ±ncp/4 samples with the true position, which
-//!   is where Schmidl-Cox's preamble-B fine timing lands on a noiseless copy. A detector
-//!   that always picks another point inside the cyclic prefix can decode every burst
-//!   and still score few hits, so read `hit` as a diagnostic only.
+//!   decoded by an offline equivalent of `Receiver::step`. It tries the header at each
+//!   detection in turn, searches on after one that fails, and keeps the first header
+//!   that decodes. A test checks it against the streaming `Receiver`;
+//! - `hit`: the detector's first detection, whatever its header does, lies within
+//!   ±ncp/4 samples of the true position, which is where Schmidl-Cox's preamble-B fine
+//!   timing lands on a noiseless copy. A detector that always picks another point
+//!   inside the cyclic prefix can decode every burst and still score few hits, so read
+//!   `hit` as a diagnostic only.
 //!
 //! `genie` decodes from the true position. It is the ceiling for any detector: the
 //! gap between `genie` and a detector is what detection costs at that CNR.
@@ -80,18 +81,31 @@ fn burst_ok(m: &Modem, rx: &[f32], b: usize, h: &Header, sent: &Burst) -> bool {
     m.decode_payload(h, &frame).into_iter().zip(&sent.payload).all(|(got, want)| got.as_ref() == Some(want))
 }
 
-/// What `Receiver` makes of `rx` with detector `f`: the position of the first
-/// detection whose header decodes (searching on after each one that fails), and
-/// whether that burst came out as sent. `None` if no header decodes.
-fn receive(m: &Modem, f: DetectFn, rx: &[f32], sent: &Burst) -> Option<(usize, bool)> {
-    let mut from = 0;
-    while let Some(b) = f(m, rx, from) {
+/// What the receiver makes of one recording with a given detector.
+struct Outcome {
+    /// Where the detector first pointed, header decoded or not.
+    first: Option<usize>,
+    /// Whether the burst came out as sent.
+    ok: bool,
+}
+
+/// Offline equivalent of `Receiver::step` with detector `f`: decode the header at
+/// each detection in turn, searching on from a detection whose header fails, and
+/// judge the burst of the first header that decodes. The test
+/// `offline_receive_matches_the_streaming_receiver` checks it against `Receiver`.
+fn receive(m: &Modem, f: DetectFn, rx: &[f32], sent: &Burst) -> Outcome {
+    let first = f(m, rx, 0);
+    let mut next = first;
+    while let Some(b) = next {
         if let Some(h) = header_at(m, rx, b) {
-            return Some((b, burst_ok(m, rx, b, &h, sent)));
+            return Outcome { first, ok: burst_ok(m, rx, b, &h, sent) };
         }
-        from = b + 1;
+        // As `Receiver::step`: search on from the failed detection itself. Neither
+        // detector can return `b` again from there, since both report a position
+        // past the start of the preamble they matched.
+        next = f(m, rx, b);
     }
-    None
+    Outcome { first, ok: false }
 }
 
 /// Outcome of one trial: (hit, burst) per detector, then the genie's burst.
@@ -100,27 +114,32 @@ struct Trial {
     genie: bool,
 }
 
-fn trial(m: &Modem, mode: &str, cnr: f32, sent: &Burst, tx: &[f32], seed: u64) -> Trial {
+fn trial(m: &Modem, mode: &str, cnr: f32, sent: &Burst, tx: &[f32], truth: usize, seed: u64) -> Trial {
     let cfg = FmChannelConfig { cnr_db: Some(cnr), seed, ..FmChannelConfig::by_name(mode).unwrap() };
-    // The channel's delays do not depend on the noise, so the clean copy gives the truth.
-    let truth = m.ofdm.detect(&transmit(&FmChannelConfig { cnr_db: None, ..cfg.clone() }, tx), 0);
-    let truth = truth.expect("burst not found on a clean channel");
     let rx = transmit(&cfg, tx);
     let tol = m.ofdm.p.ncp / 4;
     let det = DETECTORS
         .iter()
-        .map(|(_, f)| match receive(m, *f, &rx, sent) {
-            Some((b, ok)) => (b.abs_diff(truth) <= tol, ok),
-            None => (false, false),
+        .map(|(_, f)| {
+            let o = receive(m, *f, &rx, sent);
+            (o.first.is_some_and(|b| b.abs_diff(truth) <= tol), o.ok)
         })
         .collect();
     let genie = header_at(m, &rx, truth).is_some_and(|h| burst_ok(m, &rx, truth, &h, sent));
     Trial { det, genie }
 }
 
+/// Where preamble B of `tx` lands after the channel. The channel's delays do not
+/// depend on its noise, so a noiseless copy gives it for every trial.
+fn true_position(m: &Modem, mode: &str, tx: &[f32]) -> usize {
+    let clean = FmChannelConfig { cnr_db: None, ..FmChannelConfig::by_name(mode).unwrap() };
+    m.ofdm.detect(&transmit(&clean, tx), 0).expect("burst not found on a clean channel")
+}
+
 /// Run `trials` trials on every core. Trial `t` uses channel seed `1000 + t`.
 fn run_trials(m: &Modem, mode: &str, cnr: f32, sent: &Burst, trials: u32) -> Vec<Trial> {
     let tx = m.modulate(sent);
+    let truth = true_position(m, mode, &tx);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
     let mut out: Vec<(u32, Trial)> = std::thread::scope(|s| {
         let tx = &tx;
@@ -129,7 +148,7 @@ fn run_trials(m: &Modem, mode: &str, cnr: f32, sent: &Burst, trials: u32) -> Vec
                 s.spawn(move || {
                     (th..trials)
                         .step_by(threads as usize)
-                        .map(|t| (t, trial(m, mode, cnr, sent, tx, 1000 + t as u64)))
+                        .map(|t| (t, trial(m, mode, cnr, sent, tx, truth, 1000 + t as u64)))
                         .collect::<Vec<_>>()
                 })
             })
@@ -192,7 +211,7 @@ fn false_detections(m: &Modem, f: DetectFn, rx: &[f32]) -> (u32, u32) {
     let mut pos = 0;
     while let Some(b) = f(m, rx, pos) {
         dets += 1;
-        if m.ofdm.demodulate(rx, b, m.header_symbols()).and_then(|fr| m.decode_header(&fr)).is_some() {
+        if header_at(m, rx, b).is_some() {
             headers += 1;
         }
         pos = b + 1;
@@ -288,5 +307,39 @@ fn mcnemar_matches_known_values() {
     assert_eq!(mcnemar(4, 4), 1.0);
     // Past the point where 0.5^n underflows.
     assert_eq!(mcnemar(1100, 1100), 1.0);
-    assert!(mcnemar(1000, 1200) < 1e-4);
+    // z = 4.26 with continuity correction; the exact value is about 2e-5.
+    let p = mcnemar(1000, 1200);
+    assert!(p > 1e-6 && p < 1e-4, "p {p}");
+}
+
+/// `receive` must judge each recording the way the streaming `Receiver` does when
+/// it is fed the same audio in 10 ms chunks, including the recordings where the
+/// detector or the header fails. Checked with the receiver's own detector, on 12
+/// recordings per mode (`STREAM_SEEDS` for more).
+#[test]
+fn offline_receive_matches_the_streaming_receiver() {
+    let seeds: u64 = env_or("STREAM_SEEDS", 12);
+    for (mode, cnr) in [("narrow", 5.0), ("wide", 6.5)] {
+        let m = modem(mode);
+        let sent = burst(1, 1, 7);
+        let tx = m.modulate(&sent);
+        let (mut agree, mut ok) = (0, 0);
+        for seed in 0..seeds {
+            let cfg =
+                FmChannelConfig { cnr_db: Some(cnr), seed: 1000 + seed, ..FmChannelConfig::by_name(mode).unwrap() };
+            let mut rx = transmit(&cfg, &tx);
+            rx.extend(vec![0.0; 48_000]);
+            let mut receiver = Receiver::new(m.clone());
+            let got: Vec<RxBurst> = rx.chunks(480).flat_map(|c| receiver.push(c)).collect();
+            let streamed = got.first().is_some_and(|g| {
+                g.header == sent.header && g.payload.iter().zip(&sent.payload).all(|(p, s)| p.as_ref() == Some(s))
+            });
+            let offline = receive(&m, DETECTORS[0].1, &rx, &sent).ok;
+            assert_eq!(offline, streamed, "{mode} {cnr} dB seed {seed}: offline {offline}, streaming {streamed}");
+            agree += 1;
+            ok += streamed as u32;
+        }
+        // Both outcomes must occur, or the comparison proves little.
+        assert!(ok > 0 && ok < agree, "{mode}: {ok} of {seeds} bursts decoded");
+    }
 }
